@@ -478,14 +478,35 @@ impl MadaraBackend {
         &self,
         map: DatabaseKeyMapping,
     ) -> BonsaiStorage<BasicId, BonsaiDb<'_>, H> {
-        let bonsai = BonsaiStorage::new(
-            BonsaiDb::new(&self.db, map),
-            BonsaiStorageConfig {
-                max_saved_trie_logs: Some(128),
-                max_saved_snapshots: Some(128),
-                snapshot_interval: u64::MAX,
-            },
-        )
+        // TODO: Bonsai doesn't load the its id_queue on new. Instead, it requires the caller
+        //       to pass the highest value in. In our case, it should be equal to the latest block,
+        //       so we pass that in if we can obtain it.
+        //       Bonsai does, however, store the id_queue in its db, so I believe it should be able
+        //       to load this...
+        // TODO: unwrap
+        let block_n = self.get_latest_block_n().unwrap();
+        let identifiers: Vec<Vec<u8>> = Default::default();
+        let bonsai = if let Some(block_n) = block_n {
+            BonsaiStorage::new_from_transactional_state(
+                BonsaiDb::new(&self.db, map),
+                BonsaiStorageConfig {
+                    max_saved_trie_logs: Some(128),
+                    max_saved_snapshots: Some(128),
+                    snapshot_interval: u64::MAX,
+                },
+                BasicId::new(block_n),
+                identifiers,
+            )
+        } else {
+            BonsaiStorage::new(
+                BonsaiDb::new(&self.db, map),
+                BonsaiStorageConfig {
+                    max_saved_trie_logs: Some(128),
+                    max_saved_snapshots: Some(128),
+                    snapshot_interval: u64::MAX,
+                }
+            )
+        }
         // TODO(bonsai-trie): change upstream to reflect that.
         .expect("New bonsai storage can never error");
 
