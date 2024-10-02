@@ -2,6 +2,7 @@ use crate::{
     BlockImportError, BlockImportResult, BlockValidationContext, PendingBlockImportResult, PreValidatedBlock,
     PreValidatedPendingBlock, RayonPool, ReorgResult, UnverifiedHeader, ValidatedCommitments,
 };
+use bonsai_trie::id::BasicId;
 use itertools::Itertools;
 use mc_db::{MadaraBackend, MadaraStorageError};
 use mp_block::{
@@ -71,9 +72,9 @@ pub fn verify_apply_inner(
         &validation,
     ) {
         Ok((block_number, parent_block_hash)) => (block_number, parent_block_hash),
-        Err(BlockImportError::ParentHash { got, expected }) => {
-            let reorg_result = reorg(expected, got)?;
-            log::warn!("Reorg from {} to {}", reorg_result.from, reorg_result.to);
+        Err(BlockImportError::ParentHash { got: _, expected: _ }) => {
+            let reorg_result = reorg(backend, &block)?;
+            log::warn!("Reorg from 0x{:x} to 0x{:x}", reorg_result.from, reorg_result.to);
             // attempt check again
             check_parent_hash_and_num(
                 backend,
@@ -178,6 +179,13 @@ fn check_parent_hash_and_num(
         (0, Felt::ZERO)
     };
 
+    // TODO: this originally was checked after block number, but we need to check this first to detect a reorg.
+    if let Some(parent_block_hash) = parent_block_hash {
+        if parent_block_hash != expected_parent_block_hash && !validation.ignore_block_order {
+            return Err(BlockImportError::ParentHash { expected: expected_parent_block_hash, got: parent_block_hash });
+        }
+    }
+
     let block_number = if let Some(block_n) = unverified_block_number {
         if block_n != expected_block_number && !validation.ignore_block_order {
             return Err(BlockImportError::LatestBlockN { expected: expected_block_number, got: block_n });
@@ -186,12 +194,6 @@ fn check_parent_hash_and_num(
     } else {
         expected_block_number
     };
-
-    if let Some(parent_block_hash) = parent_block_hash {
-        if parent_block_hash != expected_parent_block_hash && !validation.ignore_block_order {
-            return Err(BlockImportError::ParentHash { expected: expected_parent_block_hash, got: parent_block_hash });
-        }
-    }
 
     Ok((block_number, expected_parent_block_hash))
 }
@@ -327,8 +329,40 @@ fn block_hash(
     Ok((block_hash, header))
 }
 
-fn reorg(from: Felt, to: Felt) -> Result<ReorgResult, BlockImportError> {
-    todo!("Should perform reorg here, from: {}, to: {}", from, to);
+// TODO: document
+fn reorg(
+    backend: &MadaraBackend,
+    block: &PreValidatedBlock,
+) -> Result<ReorgResult, BlockImportError> {
+
+	// TODO: return proper error
+	let block_number = block.unverified_block_number.expect("Can't reorg without block number");
+	let block_id = BasicId::new(block_number);
+
+	// TODO: the error type returned from revert_to is slightly different from others, so
+	// make_db_error() doesn't work
+
+    backend
+		.contract_trie()
+		.revert_to(block_id)
+        .map_err(|error| BlockImportError::Internal(Cow::Owned(format!("error reverting contract trie: {}", error))))?;
+
+    backend
+		.contract_storage_trie()
+		.revert_to(block_id)
+        .map_err(|error| BlockImportError::Internal(Cow::Owned(format!("error reverting contract storage trie: {}", error))))?;
+
+    backend
+		.class_trie()
+		.revert_to(block_id)
+        .map_err(|error| BlockImportError::Internal(Cow::Owned(format!("error reverting class trie: {}", error))))?;
+
+	// TODO: proper results
+	Ok(ReorgResult {
+		from: Default::default(),
+		to: Default::default(),
+	})
+
 }
 
 #[cfg(test)]
@@ -723,6 +757,9 @@ mod verify_apply_tests {
             let pending_block = finalized_block_zero(header);
             backend.store_block(pending_block.clone(), finalized_state_diff_zero(), vec![]).unwrap();
 
+            // TODO: need to call update_tries, but this takes PreValidatedBlock, not MadaraMaybePendingBlocks...
+            // update_tries(&backend, ...)
+
             // insert a block at height 1 that will be reorged away from
             let mut header = create_dummy_header();
             header.parent_block_hash = felt!("0x12345");
@@ -747,11 +784,13 @@ mod verify_apply_tests {
 
             let mut block = create_dummy_block();
             block.header.parent_block_hash = Some(felt!("0x12345"));
+            block.unverified_block_number = Some(1);
             block.unverified_global_state_root = Some(felt!("0x0"));
             block.unverified_block_hash = Some(felt!("0x1b"));
             let validation = create_validation_context(false);
 
-            let _result = verify_apply_inner(&backend, block, validation.clone());
+            let result = verify_apply_inner(&backend, block, validation.clone());
+            assert!(result.is_ok(), "verify_apply_inner failed: {:?}", result.err());
 
             let mabye_block_1_hash = backend.get_block_hash(&BlockId::Number(1)).unwrap();
             assert_eq!(mabye_block_1_hash, Some(felt!("0x1b")));

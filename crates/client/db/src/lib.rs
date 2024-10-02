@@ -481,8 +481,8 @@ impl MadaraBackend {
         let bonsai = BonsaiStorage::new(
             BonsaiDb::new(&self.db, map),
             BonsaiStorageConfig {
-                max_saved_trie_logs: Some(0),
-                max_saved_snapshots: Some(0),
+                max_saved_trie_logs: Some(128),
+                max_saved_snapshots: Some(128),
                 snapshot_interval: u64::MAX,
             },
         )
