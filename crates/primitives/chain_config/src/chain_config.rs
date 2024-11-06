@@ -1,3 +1,4 @@
+use std::fmt;
 // Note: We are NOT using fs read for constants, as they NEED to be included in the resulting
 // binary. Otherwise, using the madara binary without cloning the repo WILL crash, and that's very very bad.
 // The binary needs to be self contained! We need to be able to ship madara as a single binary, without
@@ -16,12 +17,15 @@ use anyhow::{bail, Context, Result};
 use blockifier::bouncer::{BouncerWeights, BuiltinCount};
 use blockifier::{bouncer::BouncerConfig, versioned_constants::VersionedConstants};
 use lazy_static::__Deref;
+use mp_utils::crypto::ZeroingPrivateKey;
 use primitive_types::H160;
-use serde::{Deserialize, Deserializer};
+use serde::de::{MapAccess, Visitor};
+use serde::{Deserialize, Deserializer, Serialize};
 use starknet_api::core::{ChainId, ContractAddress, PatriciaKey};
 use starknet_types_core::felt::Felt;
+use url::Url;
 
-use mp_utils::serde::deserialize_duration;
+use mp_utils::serde::{deserialize_duration, deserialize_private_key};
 
 use crate::StarknetVersion;
 
@@ -29,6 +33,18 @@ pub mod eth_core_contract_address {
     pub const MAINNET: &str = "0xc662c410C0ECf747543f5bA90660f6ABeBD9C8c4";
     pub const SEPOLIA_TESTNET: &str = "0xE2Bb56ee936fd6433DC0F6e7e3b8365C906AA057";
     pub const SEPOLIA_INTEGRATION: &str = "0x4737c0c1B4D5b1A687B42610DdabEE781152359c";
+}
+
+pub mod eth_gps_statement_verifier {
+    pub const MAINNET: &str = "0x47312450B3Ac8b5b8e247a6bB6d523e7605bDb60";
+    pub const SEPOLIA_TESTNET: &str = "0xf294781D719D2F4169cE54469C28908E6FA752C1";
+    pub const SEPOLIA_INTEGRATION: &str = "0x2046B966994Adcb88D83f467a41b75d64C2a619F";
+}
+
+pub mod public_key {
+    pub const MAINNET: &str = "0x48253ff2c3bed7af18bde0b611b083b39445959102d4947c51c4db6aa4f4e58";
+    pub const SEPOLIA_TESTNET: &str = "0x1252b6bce1351844c677869c6327e80eae1535755b611c66b8f46e595b40eea";
+    pub const SEPOLIA_INTEGRATION: &str = "0x4e4856eb36dbd5f4a7dca29f7bb5232974ef1fb7eb5b597c58077174c294da1";
 }
 
 const BLOCKIFIER_VERSIONED_CONSTANTS_JSON_0_13_0: &[u8] = include_bytes!("../resources/versioned_constants_13_0.json");
@@ -58,12 +74,17 @@ pub struct ChainConfig {
     pub chain_name: String,
     pub chain_id: ChainId,
 
+    // The Gateway URLs are the URLs of the endpoint that the node will use to sync blocks in full mode.
+    pub feeder_gateway_url: Url,
+    pub gateway_url: Url,
+
     /// For starknet, this is the STRK ERC-20 contract on starknet.
     pub native_fee_token_address: ContractAddress,
     /// For starknet, this is the ETH ERC-20 contract on starknet.
     pub parent_fee_token_address: ContractAddress,
 
     /// BTreeMap ensures order.
+    #[serde(default)]
     pub versioned_constants: ChainVersionedConstants,
 
     #[serde(deserialize_with = "deserialize_starknet_version")]
@@ -74,7 +95,7 @@ pub struct ChainConfig {
     pub block_time: Duration,
 
     /// Only used for block production.
-    /// Block time is divided into "ticks": everytime this duration elapses, the pending block is updated.  
+    /// Block time is divided into "ticks": everytime this duration elapses, the pending block is updated.
     #[serde(deserialize_with = "deserialize_duration")]
     pub pending_block_update_time: Duration,
 
@@ -92,19 +113,46 @@ pub struct ChainConfig {
     /// Only used for block production.
     pub sequencer_address: ContractAddress,
 
-    /// Only used when mempool is enabled.
-    /// When deploying an account and invoking a contract at the same time, we want to skip the validation step for the invoke tx.
-    /// This number is the maximum nonce the invoke tx can have to qualify for the validation skip.
-    pub max_nonce_for_validation_skip: u64,
-
     /// The Starknet core contract address for the L1 watcher.
     pub eth_core_contract_address: H160,
+
+    /// The Starknet SHARP verifier La address. Check out the [docs](https://docs.starknet.io/architecture-and-concepts/solidity-verifier/)
+    /// for more information
+    pub eth_gps_statement_verifier: H160,
+
+    /// Private key used by the node to sign blocks provided through the
+    /// feeder gateway. This serves as a proof of origin and in the future
+    /// will also be used by the p2p protocol and tendermint consensus.
+    /// > [!NOTE]
+    /// > This key will be auto-generated on startup if none is provided.
+    /// > This also means the private key is by default regenerated on boot
+    #[serde(default)]
+    #[serde(skip_serializing)]
+    #[serde(deserialize_with = "deserialize_private_key")]
+    pub private_key: ZeroingPrivateKey,
 }
 
 impl ChainConfig {
     pub fn from_yaml(path: &Path) -> anyhow::Result<Self> {
         let config_str = fs::read_to_string(path)?;
-        serde_yaml::from_str(&config_str).context("While deserializing chain config")
+        let config_value: serde_yaml::Value =
+            serde_yaml::from_str(&config_str).context("While deserializing chain config")?;
+
+        let versioned_constants_file_paths: BTreeMap<String, String> =
+            serde_yaml::from_value(config_value.get("versioned_constants_path").cloned().unwrap_or_default())
+                .context("While deserializing versioned constants file paths")?;
+
+        let versioned_constants = {
+            // add the defaults VersionedConstants
+            let mut versioned_constants = ChainVersionedConstants::default();
+            versioned_constants.merge(ChainVersionedConstants::from_file(versioned_constants_file_paths)?);
+            versioned_constants
+        };
+
+        let chain_config: ChainConfig =
+            serde_yaml::from_str(&config_str).context("While deserializing chain config")?;
+
+        Ok(ChainConfig { versioned_constants, ..chain_config })
     }
 
     /// Verify that the chain config is valid for block production.
@@ -132,6 +180,8 @@ impl ChainConfig {
         Self {
             chain_name: "Starknet Mainnet".into(),
             chain_id: ChainId::Mainnet,
+            feeder_gateway_url: Url::parse("https://alpha-mainnet.starknet.io/feeder_gateway/").unwrap(),
+            gateway_url: Url::parse("https://alpha-mainnet.starknet.io/gateway/").unwrap(),
             native_fee_token_address: ContractAddress(
                 PatriciaKey::try_from(Felt::from_hex_unchecked(
                     "0x04718f5a0fc34cc1af16a1cdee98ffb20c31f5cd61d6ab07201858f4287c938d",
@@ -144,15 +194,11 @@ impl ChainConfig {
                 ))
                 .unwrap(),
             ),
-            versioned_constants: [
-                (StarknetVersion::V0_13_0, BLOCKIFIER_VERSIONED_CONSTANTS_0_13_0.deref().clone()),
-                (StarknetVersion::V0_13_1, BLOCKIFIER_VERSIONED_CONSTANTS_0_13_1.deref().clone()),
-                (StarknetVersion::V0_13_1_1, BLOCKIFIER_VERSIONED_CONSTANTS_0_13_1_1.deref().clone()),
-                (StarknetVersion::V0_13_2, VersionedConstants::latest_constants().clone()),
-            ]
-            .into(),
+            versioned_constants: ChainVersionedConstants::default(),
 
             eth_core_contract_address: eth_core_contract_address::MAINNET.parse().expect("parsing a constant"),
+
+            eth_gps_statement_verifier: eth_gps_statement_verifier::MAINNET.parse().expect("parsing a constant"),
 
             latest_protocol_version: StarknetVersion::V0_13_2,
             block_time: Duration::from_secs(30),
@@ -182,8 +228,14 @@ impl ChainConfig {
                 },
             },
             // We are not producing blocks for these chains.
-            sequencer_address: ContractAddress::default(),
-            max_nonce_for_validation_skip: 2,
+            sequencer_address: ContractAddress(
+                PatriciaKey::try_from(Felt::from_hex_unchecked(
+                    "0x1176a1bd84444c89232ec27754698e5d2e7e1a7f1539f12027f28b23ec9f3d8",
+                ))
+                .unwrap(),
+            ),
+
+            private_key: ZeroingPrivateKey::default(),
         }
     }
 
@@ -191,7 +243,12 @@ impl ChainConfig {
         Self {
             chain_name: "Starknet Sepolia".into(),
             chain_id: ChainId::Sepolia,
+            feeder_gateway_url: Url::parse("https://alpha-sepolia.starknet.io/feeder_gateway/").unwrap(),
+            gateway_url: Url::parse("https://alpha-sepolia.starknet.io/gateway/").unwrap(),
             eth_core_contract_address: eth_core_contract_address::SEPOLIA_TESTNET.parse().expect("parsing a constant"),
+            eth_gps_statement_verifier: eth_gps_statement_verifier::SEPOLIA_TESTNET
+                .parse()
+                .expect("parsing a constant"),
             ..Self::starknet_mainnet()
         }
     }
@@ -200,7 +257,12 @@ impl ChainConfig {
         Self {
             chain_name: "Starknet Sepolia Integration".into(),
             chain_id: ChainId::IntegrationSepolia,
+            feeder_gateway_url: Url::parse("https://integration-sepolia.starknet.io/feeder_gateway/").unwrap(),
+            gateway_url: Url::parse("https://integration-sepolia.starknet.io/gateway/").unwrap(),
             eth_core_contract_address: eth_core_contract_address::SEPOLIA_INTEGRATION
+                .parse()
+                .expect("parsing a constant"),
+            eth_gps_statement_verifier: eth_gps_statement_verifier::SEPOLIA_INTEGRATION
                 .parse()
                 .expect("parsing a constant"),
             ..Self::starknet_mainnet()
@@ -211,6 +273,8 @@ impl ChainConfig {
         Self {
             chain_name: "Madara".into(),
             chain_id: ChainId::Other("MADARA_DEVNET".into()),
+            feeder_gateway_url: Url::parse("http://localhost:8080/feeder_gateway/").unwrap(),
+            gateway_url: Url::parse("http://localhost:8080/gateway/").unwrap(),
             sequencer_address: Felt::from_hex_unchecked("0x123").try_into().unwrap(),
             ..ChainConfig::starknet_sepolia()
         }
@@ -220,6 +284,8 @@ impl ChainConfig {
         Self {
             chain_name: "Test".into(),
             chain_id: ChainId::Other("MADARA_TEST".into()),
+            feeder_gateway_url: Url::parse("http://localhost:8080/feeder_gateway/").unwrap(),
+            gateway_url: Url::parse("http://localhost:8080/gateway/").unwrap(),
             // A random sequencer address for fee transfers to work in block production.
             sequencer_address: Felt::from_hex_unchecked(
                 "0x211b748338b39fe8fa353819d457681aa50ac598a3db84cacdd6ece0a17e1f3",
@@ -250,44 +316,81 @@ impl ChainConfig {
 
 // TODO: the motivation for these doc comments is to move them into a proper app chain developer documentation, with a
 // proper page about tuning the block production performance.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct ChainVersionedConstants(pub BTreeMap<StarknetVersion, VersionedConstants>);
 
-impl<const N: usize> From<[(StarknetVersion, VersionedConstants); N]> for ChainVersionedConstants {
-    fn from(arr: [(StarknetVersion, VersionedConstants); N]) -> Self {
-        ChainVersionedConstants(arr.into_iter().collect())
-    }
-}
-
-/// Replaces the versioned_constants files definition in the yaml by the content of the
-/// jsons.
 impl<'de> Deserialize<'de> for ChainVersionedConstants {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,
     {
-        let file_paths: BTreeMap<String, String> = Deserialize::deserialize(deserializer)?;
+        struct ChainVersionedConstantsVisitor;
+
+        impl<'de> Visitor<'de> for ChainVersionedConstantsVisitor {
+            type Value = ChainVersionedConstants;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+                formatter.write_str("a map of StarknetVersion to VersionedConstants")
+            }
+
+            fn visit_map<M>(self, mut access: M) -> Result<Self::Value, M::Error>
+            where
+                M: MapAccess<'de>,
+            {
+                let mut map = BTreeMap::new();
+                while let Some((key, value)) = access.next_entry::<String, VersionedConstants>()? {
+                    map.insert(key.parse().map_err(serde::de::Error::custom)?, value);
+                }
+                Ok(ChainVersionedConstants(map))
+            }
+        }
+
+        deserializer.deserialize_map(ChainVersionedConstantsVisitor)
+    }
+}
+
+impl<const N: usize> From<[(StarknetVersion, VersionedConstants); N]> for ChainVersionedConstants {
+    fn from(arr: [(StarknetVersion, VersionedConstants); N]) -> Self {
+        ChainVersionedConstants(arr.into())
+    }
+}
+
+impl Default for ChainVersionedConstants {
+    fn default() -> Self {
+        [
+            (StarknetVersion::V0_13_0, BLOCKIFIER_VERSIONED_CONSTANTS_0_13_0.deref().clone()),
+            (StarknetVersion::V0_13_1, BLOCKIFIER_VERSIONED_CONSTANTS_0_13_1.deref().clone()),
+            (StarknetVersion::V0_13_1_1, BLOCKIFIER_VERSIONED_CONSTANTS_0_13_1_1.deref().clone()),
+            (StarknetVersion::V0_13_2, BLOCKIFIER_VERSIONED_CONSTANTS_0_13_2.deref().clone()),
+        ]
+        .into()
+    }
+}
+
+impl ChainVersionedConstants {
+    pub fn add(&mut self, version: StarknetVersion, constants: VersionedConstants) {
+        self.0.insert(version, constants);
+    }
+
+    pub fn merge(&mut self, other: Self) {
+        self.0.extend(other.0);
+    }
+
+    pub fn from_file(version_with_path: BTreeMap<String, String>) -> Result<Self> {
         let mut result = BTreeMap::new();
 
-        for (version, path) in file_paths {
+        for (version, path) in version_with_path {
             // Change the current directory to Madara root
-            let mut file = File::open(Path::new(&path))
-                .with_context(|| format!("Failed to open file: {}", path))
-                .map_err(serde::de::Error::custom)?;
+            let mut file = File::open(Path::new(&path)).with_context(|| format!("Failed to open file: {}", path))?;
 
             let mut contents = String::new();
-            file.read_to_string(&mut contents)
-                .with_context(|| format!("Failed to read contents of file: {}", path))
-                .map_err(serde::de::Error::custom)?;
+            file.read_to_string(&mut contents).with_context(|| format!("Failed to read contents of file: {}", path))?;
 
-            let constants: VersionedConstants = serde_json::from_str(&contents)
-                .with_context(|| format!("Failed to parse JSON in file: {}", path))
-                .map_err(serde::de::Error::custom)?;
+            let constants: VersionedConstants =
+                serde_json::from_str(&contents).with_context(|| format!("Failed to parse JSON in file: {}", path))?;
 
-            let parsed_version = version
-                .parse()
-                .with_context(|| format!("Failed to parse version string: {}", version))
-                .map_err(serde::de::Error::custom)?;
+            let parsed_version =
+                version.parse().with_context(|| format!("Failed to parse version string: {}", version))?;
 
             result.insert(parsed_version, constants);
         }
@@ -304,6 +407,13 @@ where
     StarknetVersion::from_str(&s).map_err(serde::de::Error::custom)
 }
 
+pub fn serialize_starknet_version<S>(version: &StarknetVersion, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    version.to_string().serialize(serializer)
+}
+
 // TODO: this is workaround because BouncerConfig doesn't derive Deserialize in blockifier
 pub fn deserialize_bouncer_config<'de, D>(deserializer: D) -> Result<BouncerConfig, D::Error>
 where
@@ -316,6 +426,18 @@ where
 
     let helper = BouncerConfigHelper::deserialize(deserializer)?;
     Ok(BouncerConfig { block_max_capacity: helper.block_max_capacity })
+}
+
+pub fn serialize_bouncer_config<S>(config: &BouncerConfig, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    #[derive(Serialize)]
+    struct BouncerConfigHelper<'a> {
+        block_max_capacity: &'a BouncerWeights,
+    }
+
+    BouncerConfigHelper { block_max_capacity: &config.block_max_capacity }.serialize(serializer)
 }
 
 #[cfg(test)]
@@ -409,8 +531,13 @@ mod tests {
         assert_eq!(chain_config.bouncer_config.block_max_capacity.state_diff_size, 131072);
         assert_eq!(chain_config.bouncer_config.block_max_capacity.builtin_count.add_mod, 18446744073709551615);
 
-        assert_eq!(chain_config.sequencer_address, ContractAddress::try_from(Felt::from_str("0x0").unwrap()).unwrap());
-        assert_eq!(chain_config.max_nonce_for_validation_skip, 2);
+        assert_eq!(
+            chain_config.sequencer_address,
+            ContractAddress::try_from(
+                Felt::from_str("0x1176a1bd84444c89232ec27754698e5d2e7e1a7f1539f12027f28b23ec9f3d8").unwrap()
+            )
+            .unwrap()
+        );
         assert_eq!(
             chain_config.eth_core_contract_address,
             H160::from_str("0xc662c410C0ECf747543f5bA90660f6ABeBD9C8c4").unwrap()

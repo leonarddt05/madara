@@ -2,13 +2,17 @@
 
 pub mod header;
 
+use std::fmt::Display;
+
 pub use header::Header;
-use header::PendingHeader;
+use header::{L1DataAvailabilityMode, PendingHeader};
 use mp_chain_config::StarknetVersion;
 use mp_receipt::TransactionReceipt;
 use mp_transactions::Transaction;
 pub use primitive_types::{H160, U256};
 use starknet_types_core::felt::Felt;
+
+use crate::header::GasPrices;
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[allow(clippy::large_enum_variant)]
@@ -24,6 +28,14 @@ impl MadaraMaybePendingBlockInfo {
             MadaraMaybePendingBlockInfo::NotPending(v) => Some(v),
         }
     }
+
+    pub fn as_nonpending_owned(self) -> Option<MadaraBlockInfo> {
+        match self {
+            MadaraMaybePendingBlockInfo::Pending(_) => None,
+            MadaraMaybePendingBlockInfo::NotPending(v) => Some(v),
+        }
+    }
+
     pub fn as_pending(&self) -> Option<&MadaraPendingBlockInfo> {
         match self {
             MadaraMaybePendingBlockInfo::Pending(v) => Some(v),
@@ -66,9 +78,55 @@ impl From<MadaraPendingBlockInfo> for MadaraMaybePendingBlockInfo {
         Self::Pending(value)
     }
 }
+
 impl From<MadaraBlockInfo> for MadaraMaybePendingBlockInfo {
     fn from(value: MadaraBlockInfo) -> Self {
         Self::NotPending(value)
+    }
+}
+
+impl From<MadaraBlockInfo> for starknet_types_rpc::BlockHeader<Felt> {
+    fn from(info: MadaraBlockInfo) -> Self {
+        let MadaraBlockInfo {
+            header:
+                Header {
+                    parent_block_hash: parent_hash,
+                    block_number,
+                    global_state_root: new_root,
+                    sequencer_address,
+                    block_timestamp: timestamp,
+                    protocol_version,
+                    l1_gas_price,
+                    l1_da_mode,
+                    ..
+                },
+            block_hash,
+            ..
+        } = info;
+        let GasPrices { eth_l1_gas_price, strk_l1_gas_price, eth_l1_data_gas_price, strk_l1_data_gas_price } =
+            l1_gas_price;
+
+        Self {
+            block_hash,
+            block_number,
+            l1_da_mode: match l1_da_mode {
+                L1DataAvailabilityMode::Blob => starknet_types_rpc::L1DaMode::Blob,
+                L1DataAvailabilityMode::Calldata => starknet_types_rpc::L1DaMode::Calldata,
+            },
+            l1_data_gas_price: starknet_types_rpc::ResourcePrice {
+                price_in_fri: Felt::from(strk_l1_data_gas_price),
+                price_in_wei: Felt::from(eth_l1_data_gas_price),
+            },
+            l1_gas_price: starknet_types_rpc::ResourcePrice {
+                price_in_fri: Felt::from(strk_l1_gas_price),
+                price_in_wei: Felt::from(eth_l1_gas_price),
+            },
+            new_root,
+            parent_hash,
+            sequencer_address,
+            starknet_version: protocol_version.to_string(),
+            timestamp,
+        }
     }
 }
 
@@ -90,6 +148,7 @@ impl From<starknet_core::types::BlockTag> for BlockTag {
         }
     }
 }
+
 impl From<BlockTag> for starknet_core::types::BlockTag {
     fn from(value: BlockTag) -> Self {
         match value {
@@ -123,6 +182,18 @@ impl From<BlockId> for starknet_core::types::BlockId {
             BlockId::Hash(felt) => starknet_core::types::BlockId::Hash(felt),
             BlockId::Number(number) => starknet_core::types::BlockId::Number(number),
             BlockId::Tag(tag) => starknet_core::types::BlockId::Tag(tag.into()),
+        }
+    }
+}
+impl Display for BlockId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            BlockId::Hash(hash) => write!(f, "0x{hash:x}"),
+            BlockId::Number(number) => write!(f, "{number}"),
+            BlockId::Tag(blocktag) => match blocktag {
+                BlockTag::Latest => write!(f, "latest"),
+                BlockTag::Pending => write!(f, "pending"),
+            },
         }
     }
 }
@@ -180,6 +251,12 @@ impl MadaraBlockInner {
 pub struct MadaraMaybePendingBlock {
     pub info: MadaraMaybePendingBlockInfo,
     pub inner: MadaraBlockInner,
+}
+
+impl MadaraMaybePendingBlock {
+    pub fn is_pending(&self) -> bool {
+        matches!(self.info, MadaraMaybePendingBlockInfo::Pending(_))
+    }
 }
 
 /// Starknet block definition.

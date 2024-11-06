@@ -9,10 +9,13 @@ use mc_block_import::{
 };
 use mc_db::MadaraBackend;
 use mc_db::MadaraStorageError;
+use mc_gateway::client::builder::FeederClient;
+use mc_gateway::error::SequencerError;
 use mc_telemetry::{TelemetryHandle, VerbosityLevel};
+use mp_block::BlockId;
+use mp_block::BlockTag;
 use mp_utils::{channel_wait_or_graceful_shutdown, wait_or_graceful_shutdown, PerfStopwatch};
 use starknet_api::core::ChainId;
-use starknet_providers::{ProviderError, SequencerGatewayProvider};
 use starknet_types_core::felt::Felt;
 use std::pin::pin;
 use std::sync::Arc;
@@ -24,7 +27,7 @@ use tokio::time::Duration;
 #[derive(thiserror::Error, Debug)]
 pub enum L2SyncError {
     #[error("Provider error: {0:#}")]
-    Provider(#[from] ProviderError),
+    SequencerError(#[from] SequencerError),
     #[error("Database error: {0:#}")]
     Db(#[from] MadaraStorageError),
     #[error(transparent)]
@@ -42,6 +45,7 @@ pub struct L2StateUpdate {
 }
 
 #[allow(clippy::too_many_arguments)]
+#[tracing::instrument(skip(backend, updates_receiver, block_import, validation), fields(module = "Sync"))]
 async fn l2_verify_and_apply_task(
     backend: Arc<MadaraBackend>,
     mut updates_receiver: mpsc::Receiver<PreValidatedBlock>,
@@ -53,14 +57,14 @@ async fn l2_verify_and_apply_task(
     while let Some(block) = channel_wait_or_graceful_shutdown(pin!(updates_receiver.recv())).await {
         let BlockImportResult { header, block_hash } = block_import.verify_apply(block, validation.clone()).await?;
 
-        log::info!(
+        tracing::info!(
             "✨ Imported #{} ({}) and updated state root ({})",
             header.block_number,
             trim_hash(&block_hash),
             trim_hash(&header.global_state_root)
         );
-        log::debug!(
-            "Block import #{} ({}) has state root {}",
+        tracing::debug!(
+            "Block import #{} ({:#x}) has state root {:#x}",
             header.block_number,
             block_hash,
             header.global_state_root
@@ -77,10 +81,10 @@ async fn l2_verify_and_apply_task(
         );
 
         if backup_every_n_blocks.is_some_and(|backup_every_n_blocks| header.block_number % backup_every_n_blocks == 0) {
-            log::info!("⏳ Backing up database at block {}...", header.block_number);
+            tracing::info!("⏳ Backing up database at block {}...", header.block_number);
             let sw = PerfStopwatch::new();
             backend.backup().await.context("backing up database")?;
-            log::info!("✅ Database backup is done ({:?})", sw.elapsed());
+            tracing::info!("✅ Database backup is done ({:?})", sw.elapsed());
         }
     }
 
@@ -124,13 +128,13 @@ async fn l2_pending_block_task(
     block_import: Arc<BlockImporter>,
     validation: BlockValidationContext,
     sync_finished_cb: oneshot::Receiver<()>,
-    provider: Arc<SequencerGatewayProvider>,
+    provider: Arc<FeederClient>,
     pending_block_poll_interval: Duration,
 ) -> anyhow::Result<()> {
     // clear pending status
     {
         backend.clear_pending_block().context("Clearing pending block")?;
-        log::debug!("l2_pending_block_task: startup: wrote no pending");
+        tracing::debug!("l2_pending_block_task: startup: wrote no pending");
     }
 
     // we start the pending block task only once the node has been fully sync
@@ -139,16 +143,24 @@ async fn l2_pending_block_task(
         return Ok(());
     }
 
-    log::debug!("start pending block poll");
+    tracing::debug!("Start pending block poll");
 
     let mut interval = tokio::time::interval(pending_block_poll_interval);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     while wait_or_graceful_shutdown(interval.tick()).await.is_some() {
-        log::debug!("getting pending block...");
+        tracing::debug!("Getting pending block...");
 
-        let block = fetch_pending_block_and_updates(&backend.chain_config().chain_id, &provider)
-            .await
-            .context("Getting pending block from FGW")?;
+        let current_block_hash = backend
+            .get_block_hash(&BlockId::Tag(BlockTag::Latest))
+            .context("Getting latest block hash")?
+            .unwrap_or(/* genesis parent block hash */ Felt::ZERO);
+        let Some(block) =
+            fetch_pending_block_and_updates(current_block_hash, &backend.chain_config().chain_id, &provider)
+                .await
+                .context("Getting pending block from FGW")?
+        else {
+            continue;
+        };
 
         // HACK(see issue #239): The latest block in db may not match the pending parent block hash
         // Just silently ignore it for now and move along.
@@ -159,7 +171,7 @@ async fn l2_pending_block_task(
         };
 
         if let Err(err) = import_block().await {
-            log::debug!("Error while importing pending block: {err:#}");
+            tracing::debug!("Error while importing pending block: {err:#}");
         }
     }
 
@@ -178,9 +190,10 @@ pub struct L2SyncConfig {
 
 /// Spawns workers to fetch blocks and state updates from the feeder.
 #[allow(clippy::too_many_arguments)]
+#[tracing::instrument(skip(backend, provider, config, chain_id, telemetry, block_importer), fields(module = "Sync"))]
 pub async fn sync(
     backend: &Arc<MadaraBackend>,
-    provider: SequencerGatewayProvider,
+    provider: FeederClient,
     config: L2SyncConfig,
     chain_id: ChainId,
     telemetry: TelemetryHandle,
@@ -202,7 +215,7 @@ pub async fn sync(
     // starves the tokio worker
     let validation = BlockValidationContext {
         trust_transaction_hashes: false,
-        trust_global_tries: config.verify,
+        trust_global_tries: !config.verify,
         chain_id,
         trust_class_hashes: false,
         ignore_block_order: config.ignore_block_order,
@@ -246,4 +259,175 @@ pub async fn sync(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tests::utils::gateway::{test_setup, TestContext};
+    use mc_block_import::tests::block_import_utils::create_dummy_unverified_full_block;
+    use mc_block_import::BlockImporter;
+    use mc_db::{db_block_id::DbBlockId, MadaraBackend};
+
+    use mc_telemetry::TelemetryService;
+    use mp_block::header::L1DataAvailabilityMode;
+    use mp_block::MadaraBlock;
+    use mp_chain_config::StarknetVersion;
+    use rstest::rstest;
+    use starknet_types_core::felt::Felt;
+    use std::sync::Arc;
+    use tokio::sync::mpsc;
+
+    /// Test the `l2_verify_and_apply_task` function.
+    ///
+    ///
+    /// This test verifies the behavior of the `l2_verify_and_apply_task` by simulating
+    /// a block verification and application process.
+    ///
+    /// # Test Steps
+    /// 1. Initialize the backend and necessary components.
+    /// 2. Create a mock block.
+    /// 3. Spawn the `l2_verify_and_apply_task` in a new thread.
+    /// 4. Send the mock block for verification and application.
+    /// 5. Wait for the task to complete or for a timeout to occur.
+    /// 6. Verify that the block has been correctly applied to the backend.
+    ///
+    /// # Panics
+    /// - If the task fails or if the waiting timeout is exceeded.
+    /// - If the block is not correctly applied to the backend.
+    #[rstest]
+    #[tokio::test]
+    async fn test_l2_verify_and_apply_task(test_setup: Arc<MadaraBackend>) {
+        let backend = test_setup;
+        let (block_conv_sender, block_conv_receiver) = mpsc::channel(100);
+        let block_importer = Arc::new(BlockImporter::new(backend.clone(), None, true).unwrap());
+        let validation = BlockValidationContext::new(backend.chain_config().chain_id.clone());
+        let telemetry = TelemetryService::new(true, vec![]).unwrap().new_handle();
+
+        let mock_block = create_dummy_unverified_full_block();
+
+        let task_handle = tokio::spawn(l2_verify_and_apply_task(
+            backend.clone(),
+            block_conv_receiver,
+            block_importer.clone(),
+            validation.clone(),
+            Some(1),
+            telemetry,
+        ));
+
+        let mock_pre_validated_block = block_importer.pre_validate(mock_block, validation.clone()).await.unwrap();
+        block_conv_sender.send(mock_pre_validated_block).await.unwrap();
+
+        drop(block_conv_sender);
+
+        match tokio::time::timeout(std::time::Duration::from_secs(120), task_handle).await {
+            Ok(Ok(_)) => (),
+            Ok(Err(e)) => panic!("Task failed: {:?}", e),
+            Err(_) => panic!("Timeout reached while waiting for task completion"),
+        }
+
+        let applied_block = backend.get_block(&DbBlockId::Number(0)).unwrap();
+        assert!(applied_block.is_some(), "The block was not applied correctly");
+        let applied_block = MadaraBlock::try_from(applied_block.unwrap()).unwrap();
+
+        assert_eq!(applied_block.info.header.block_number, 0, "Block number does not match");
+        assert_eq!(applied_block.info.header.block_timestamp, 0, "Block timestamp does not match");
+        assert_eq!(applied_block.info.header.parent_block_hash, Felt::ZERO, "Parent block hash does not match");
+        assert!(applied_block.inner.transactions.is_empty(), "Block should not contain any transactions");
+        assert_eq!(
+            applied_block.info.header.protocol_version,
+            StarknetVersion::default(),
+            "Protocol version does not match"
+        );
+        assert_eq!(applied_block.info.header.sequencer_address, Felt::ZERO, "Sequencer address does not match");
+        assert_eq!(applied_block.info.header.l1_gas_price.eth_l1_gas_price, 0, "L1 gas price (ETH) does not match");
+        assert_eq!(applied_block.info.header.l1_gas_price.strk_l1_gas_price, 0, "L1 gas price (STRK) does not match");
+        assert_eq!(applied_block.info.header.l1_da_mode, L1DataAvailabilityMode::Blob, "L1 DA mode does not match");
+    }
+
+    /// Test the `l2_block_conversion_task` function.
+    ///
+    /// Steps:
+    /// 1. Initialize necessary components.
+    /// 2. Create a mock block.
+    /// 3. Send the mock block to updates_sender
+    /// 4. Call the `l2_block_conversion_task` function with the mock data.
+    /// 5. Verify the results and ensure the function behaves as expected.
+    #[rstest]
+    #[tokio::test]
+    async fn test_l2_block_conversion_task(test_setup: Arc<MadaraBackend>) {
+        let backend = test_setup;
+        let (updates_sender, updates_receiver) = mpsc::channel(100);
+        let (output_sender, mut output_receiver) = mpsc::channel(100);
+        let block_import = Arc::new(BlockImporter::new(backend.clone(), None, true).unwrap());
+        let validation = BlockValidationContext::new(backend.chain_config().chain_id.clone());
+
+        let mock_block = create_dummy_unverified_full_block();
+
+        updates_sender.send(mock_block).await.unwrap();
+
+        let task_handle =
+            tokio::spawn(l2_block_conversion_task(updates_receiver, output_sender, block_import, validation));
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), output_receiver.recv()).await;
+        match result {
+            Ok(Some(b)) => {
+                assert_eq!(b.unverified_block_number, Some(0), "Block number does not match");
+            }
+            Ok(None) => panic!("Channel closed without receiving a result"),
+            Err(_) => panic!("Timeout reached while waiting for result"),
+        }
+
+        // Close the updates_sender channel to allow the task to complete
+        drop(updates_sender);
+
+        match tokio::time::timeout(std::time::Duration::from_secs(5), task_handle).await {
+            Ok(Ok(_)) => (),
+            Ok(Err(e)) => panic!("Task failed: {:?}", e),
+            Err(_) => panic!("Timeout reached while waiting for task completion"),
+        }
+    }
+
+    /// Test the `l2_pending_block_task` function.
+    ///
+    /// This test function verifies the behavior of the `l2_pending_block_task`.
+    /// It simulates the necessary environment and checks that the task executes correctly
+    /// within a specified timeout.
+    ///
+    /// # Test Steps
+    /// 1. Initialize the backend and test context.
+    /// 2. Create a `BlockImporter` and a `BlockValidationContext`.
+    /// 3. Spawn the `l2_pending_block_task` in a new thread.
+    /// 4. Simulate the "once_caught_up" signal.
+    /// 5. Wait for the task to complete or for a timeout to occur.
+    ///
+    /// # Panics
+    /// - If the task fails or if the waiting timeout is exceeded.
+    #[rstest]
+    #[tokio::test]
+    async fn test_l2_pending_block_task(test_setup: Arc<MadaraBackend>) {
+        let backend = test_setup;
+        let ctx = TestContext::new(backend.clone());
+        let block_import = Arc::new(BlockImporter::new(backend.clone(), None, true).unwrap());
+        let validation = BlockValidationContext::new(backend.chain_config().chain_id.clone());
+
+        let task_handle = tokio::spawn(l2_pending_block_task(
+            backend.clone(),
+            block_import.clone(),
+            validation.clone(),
+            ctx.once_caught_up_receiver,
+            ctx.provider.clone(),
+            std::time::Duration::from_secs(5),
+        ));
+
+        // Simulate the "once_caught_up" signal
+        ctx.once_caught_up_sender.send(()).unwrap();
+
+        // Wait for the task to complete
+        match tokio::time::timeout(std::time::Duration::from_secs(120), task_handle).await {
+            Ok(Ok(_)) => (),
+            Ok(Err(e)) => panic!("Task failed: {:?}", e),
+            Err(_) => panic!("Timeout reached while waiting for task completion"),
+        }
+    }
 }

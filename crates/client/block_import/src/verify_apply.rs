@@ -1,6 +1,5 @@
 use crate::{
-    BlockImportError, BlockImportResult, BlockValidationContext, PendingBlockImportResult, PreValidatedBlock,
-    PreValidatedPendingBlock, RayonPool, ReorgResult, UnverifiedHeader, ValidatedCommitments,
+    global_spawn_rayon_task, BlockImportError, BlockImportResult, BlockValidationContext, PendingBlockImportResult, PreValidatedBlock, PreValidatedPendingBlock, ReorgResult, UnverifiedHeader, ValidatedCommitments
 };
 use bonsai_trie::id::BasicId;
 use itertools::Itertools;
@@ -19,7 +18,6 @@ mod classes;
 mod contracts;
 
 pub struct VerifyApply {
-    pool: Arc<RayonPool>,
     pub(crate) backend: Arc<MadaraBackend>,
     // Only one thread at once can verify_apply. This is the update trie step cannot be parallelized over blocks, and in addition
     // our database does not support concurrent write access.
@@ -27,20 +25,28 @@ pub struct VerifyApply {
 }
 
 impl VerifyApply {
-    pub fn new(backend: Arc<MadaraBackend>, pool: Arc<RayonPool>) -> Self {
-        Self { pool, backend, mutex: Default::default() }
+    pub fn new(backend: Arc<MadaraBackend>) -> Self {
+        Self { backend, mutex: Default::default() }
     }
 
     /// This function wraps the [`verify_apply_inner`] step, which runs on the rayon pool, in a tokio-friendly future.
+    ///
+    /// NOTE: we do not use [`crate::rayon::RayonPool`], but [`global_spawn_rayon_task`] - this is because that would allow for a deadlock if we were to share
+    /// the semaphore with the [`crate::pre_validate`] task.
+    /// This is fine because the [`VerifyApply::mutex`] ensures correct backpressure handling.
     pub async fn verify_apply(
         &self,
         block: PreValidatedBlock,
         validation: BlockValidationContext,
     ) -> Result<BlockImportResult, BlockImportError> {
+        tracing::debug!("acquiring verify_apply exclusive");
         let _exclusive = self.mutex.lock().await;
+        tracing::debug!("acquired verify_apply exclusive");
 
         let backend = Arc::clone(&self.backend);
-        self.pool.spawn_rayon_task(move || verify_apply_inner(&backend, block, validation)).await
+        let res = global_spawn_rayon_task(move || verify_apply_inner(&backend, block, validation)).await;
+        tracing::debug!("releasing verify_apply exclusive");
+        res
     }
 
     /// See [`Self::verify_apply`].
@@ -49,10 +55,14 @@ impl VerifyApply {
         block: PreValidatedPendingBlock,
         validation: BlockValidationContext,
     ) -> Result<PendingBlockImportResult, BlockImportError> {
+        tracing::debug!("acquiring verify_apply exclusive (pending)");
         let _exclusive = self.mutex.lock().await;
+        tracing::debug!("acquired verify_apply exclusive (pending)");
 
         let backend = Arc::clone(&self.backend);
-        self.pool.spawn_rayon_task(move || verify_apply_pending_inner(&backend, block, validation)).await
+        let res = global_spawn_rayon_task(move || verify_apply_pending_inner(&backend, block, validation)).await;
+        tracing::debug!("releasing verify_apply exclusive (pending)");
+        res
     }
 }
 
@@ -92,7 +102,7 @@ pub fn verify_apply_inner(
     // Block hash
     let (block_hash, header) = block_hash(&block, &validation, block_number, parent_block_hash, global_state_root)?;
 
-    log::debug!("verify_apply_inner store block {}", header.block_number);
+    tracing::debug!("verify_apply_inner store block {}", header.block_number);
 
     // store block, also uses rayon heavily internally
     backend
@@ -225,15 +235,15 @@ fn update_tries(
         return Ok(global_state_root);
     }
 
-    log::debug!(
+    tracing::debug!(
         "Deployed contracts: [{:?}]",
         block.state_diff.deployed_contracts.iter().map(|c| c.address.hex_display()).format(", ")
     );
-    log::debug!(
+    tracing::debug!(
         "Declared classes: [{:?}]",
         block.state_diff.declared_classes.iter().map(|c| c.class_hash.hex_display()).format(", ")
     );
-    log::debug!(
+    tracing::debug!(
         "Deprecated declared classes: [{:?}]",
         block.state_diff.deprecated_declared_classes.iter().map(|c| c.hex_display()).format(", ")
     );
@@ -305,9 +315,9 @@ fn block_hash(
         transaction_commitment,
         event_count,
         event_commitment,
-        state_diff_length,
-        state_diff_commitment,
-        receipt_commitment,
+        state_diff_length: Some(state_diff_length),
+        state_diff_commitment: Some(state_diff_commitment),
+        receipt_commitment: Some(receipt_commitment),
         protocol_version,
         l1_gas_price,
         l1_da_mode,
@@ -615,8 +625,8 @@ mod verify_apply_tests {
             felt!("0x1"),
             felt!("0xa"),
             Err(BlockImportError::BlockHash {
-                got: felt!("0x271814f105da644661d0ef938cfccfd66d3e3585683fbcbee339db3d29c4574"), 
-                expected: felt!("0xdeadbeef") 
+                got: felt!("0x271814f105da644661d0ef938cfccfd66d3e3585683fbcbee339db3d29c4574"),
+                expected: felt!("0xdeadbeef")
             })
         )]
     // Case 3: Special trusted case for Mainnet blocks 1466-2242

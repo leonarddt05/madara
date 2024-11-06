@@ -1,56 +1,57 @@
 //! Madara database
 
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
-use std::{fmt, fs};
-
 use anyhow::{Context, Result};
 use bonsai_db::{BonsaiDb, DatabaseKeyMapping};
 use bonsai_trie::id::BasicId;
 use bonsai_trie::{BonsaiStorage, BonsaiStorageConfig};
 use db_metrics::DbMetrics;
-use mc_metrics::MetricsRegistry;
 use mp_chain_config::ChainConfig;
 use mp_utils::service::Service;
 use rocksdb::backup::{BackupEngine, BackupEngineOptions};
-
-pub mod block_db;
-mod error;
 use rocksdb::{
     BoundColumnFamily, ColumnFamilyDescriptor, DBCompressionType, DBWithThreadMode, Env, FlushOptions, MultiThreaded,
     Options, SliceTransform,
 };
+use starknet_types_core::hash::{Pedersen, Poseidon, StarkHash};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+use std::{fmt, fs};
+use tokio::sync::{mpsc, oneshot};
+
+pub mod block_db;
 pub mod bonsai_db;
 pub mod class_db;
 pub mod contract_db;
 pub mod db_block_id;
 pub mod db_metrics;
 pub mod devnet_db;
+mod error;
 pub mod l1_db;
 pub mod storage_updates;
 pub mod tests;
 
 pub use error::{MadaraStorageError, TrieType};
-use starknet_types_core::hash::{Pedersen, Poseidon, StarkHash};
-use tokio::sync::{mpsc, oneshot};
-
 pub type DB = DBWithThreadMode<MultiThreaded>;
-
 pub use rocksdb;
 pub type WriteBatchWithTransaction = rocksdb::WriteBatchWithTransaction<false>;
 
 const DB_UPDATES_BATCH_SIZE: usize = 1024;
 
+#[allow(clippy::identity_op)] // allow 1 * MiB
+#[allow(non_upper_case_globals)] // allow KiB/MiB/GiB names
 pub fn open_rocksdb(path: &Path, create: bool) -> Result<Arc<DB>> {
+    const KiB: usize = 1024;
+    const MiB: usize = 1024 * KiB;
+    const GiB: usize = 1024 * MiB;
+
     let mut opts = Options::default();
     opts.set_report_bg_io_stats(true);
     opts.set_use_fsync(false);
     opts.create_if_missing(create);
     opts.create_missing_column_families(true);
-    opts.set_bytes_per_sync(1024 * 1024);
     opts.set_keep_log_file_num(1);
-    opts.optimize_level_style_compaction(4096 * 1024 * 1024);
+    opts.optimize_level_style_compaction(4 * GiB);
     opts.set_compression_type(DBCompressionType::Zstd);
     let cores = std::thread::available_parallelism().map(|e| e.get() as i32).unwrap_or(1);
     opts.increase_parallelism(cores);
@@ -59,13 +60,18 @@ pub fn open_rocksdb(path: &Path, create: bool) -> Result<Arc<DB>> {
     opts.set_manual_wal_flush(true);
     opts.set_max_subcompactions(cores as _);
 
+    opts.set_max_log_file_size(1 * MiB);
+    opts.set_max_open_files(512); // 512 is the value used by substrate for reference
+    opts.set_keep_log_file_num(3);
+    opts.set_log_level(rocksdb::LogLevel::Warn);
+
     let mut env = Env::new().context("Creating rocksdb env")?;
     // env.set_high_priority_background_threads(cores); // flushes
     env.set_low_priority_background_threads(cores); // compaction
 
     opts.set_env(&env);
 
-    log::debug!("opening db at {:?}", path.display());
+    tracing::debug!("opening db at {:?}", path.display());
     let db = DB::open_cf_descriptors(
         &opts,
         path,
@@ -91,13 +97,13 @@ fn spawn_backup_db_task(
         .context("Opening backup engine")?;
 
     if restore_from_latest_backup {
-        log::info!("⏳ Restoring latest backup...");
-        log::debug!("restore path is {db_path:?}");
+        tracing::info!("⏳ Restoring latest backup...");
+        tracing::debug!("restore path is {db_path:?}");
         fs::create_dir_all(db_path).with_context(|| format!("creating directories {:?}", db_path))?;
 
         let opts = rocksdb::backup::RestoreOptions::default();
         engine.restore_from_latest_backup(db_path, db_path, &opts).context("Restoring database")?;
-        log::debug!("restoring latest backup done");
+        tracing::debug!("restoring latest backup done");
     }
 
     db_restored_cb.send(()).ok().context("Receiver dropped")?;
@@ -308,6 +314,7 @@ pub struct MadaraBackend {
     last_flush_time: Mutex<Option<Instant>>,
     chain_config: Arc<ChainConfig>,
     db_metrics: DbMetrics,
+    sender_block_info: tokio::sync::broadcast::Sender<mp_block::MadaraBlockInfo>,
     #[cfg(feature = "testing")]
     _temp_dir: Option<tempfile::TempDir>,
 }
@@ -335,18 +342,12 @@ impl DatabaseService {
         backup_dir: Option<PathBuf>,
         restore_from_latest_backup: bool,
         chain_config: Arc<ChainConfig>,
-        metrics_registry: &MetricsRegistry,
     ) -> anyhow::Result<Self> {
-        log::info!("💾 Opening database at: {}", base_path.display());
+        tracing::info!("💾 Opening database at: {}", base_path.display());
 
-        let handle = MadaraBackend::open(
-            base_path.to_owned(),
-            backup_dir.clone(),
-            restore_from_latest_backup,
-            chain_config,
-            metrics_registry,
-        )
-        .await?;
+        let handle =
+            MadaraBackend::open(base_path.to_owned(), backup_dir.clone(), restore_from_latest_backup, chain_config)
+                .await?;
 
         Ok(Self { handle })
     }
@@ -370,7 +371,7 @@ struct BackupRequest {
 
 impl Drop for MadaraBackend {
     fn drop(&mut self) {
-        log::info!("⏳ Gracefully closing the database...");
+        tracing::info!("⏳ Gracefully closing the database...");
         self.maybe_flush(true).expect("Error when flushing the database"); // flush :)
     }
 }
@@ -388,7 +389,8 @@ impl MadaraBackend {
             db: open_rocksdb(temp_dir.as_ref(), true).unwrap(),
             last_flush_time: Default::default(),
             chain_config,
-            db_metrics: DbMetrics::register(&MetricsRegistry::dummy()).unwrap(),
+            db_metrics: DbMetrics::register().unwrap(),
+            sender_block_info: tokio::sync::broadcast::channel(100).0,
             _temp_dir: Some(temp_dir),
         })
     }
@@ -399,7 +401,6 @@ impl MadaraBackend {
         backup_dir: Option<PathBuf>,
         restore_from_latest_backup: bool,
         chain_config: Arc<ChainConfig>,
-        metrics_registry: &MetricsRegistry,
     ) -> Result<Arc<MadaraBackend>> {
         let db_path = db_config_dir.join("db");
 
@@ -415,9 +416,9 @@ impl MadaraBackend {
                     .expect("Database backup thread")
             });
 
-            log::debug!("blocking on db restoration");
+            tracing::debug!("blocking on db restoration");
             restored_cb_recv.await.context("Restoring database")?;
-            log::debug!("done blocking on db restoration");
+            tracing::debug!("done blocking on db restoration");
 
             Some(sender)
         } else {
@@ -427,11 +428,12 @@ impl MadaraBackend {
         let db = open_rocksdb(&db_path, true)?;
 
         let backend = Arc::new(Self {
-            db_metrics: DbMetrics::register(metrics_registry).context("Registering db metrics")?,
+            db_metrics: DbMetrics::register().context("Registering db metrics")?,
             backup_handle,
             db,
             last_flush_time: Default::default(),
             chain_config: Arc::clone(&chain_config),
+            sender_block_info: tokio::sync::broadcast::channel(100).0,
             #[cfg(feature = "testing")]
             _temp_dir: None,
         });
@@ -447,7 +449,7 @@ impl MadaraBackend {
                 None => true,
             };
         if will_flush {
-            log::debug!("doing a db flush");
+            tracing::debug!("doing a db flush");
             let mut opts = FlushOptions::default();
             opts.set_wait(true);
             // we have to collect twice here :/
@@ -461,6 +463,7 @@ impl MadaraBackend {
         Ok(will_flush)
     }
 
+    #[tracing::instrument(skip(self))]
     pub async fn backup(&self) -> Result<()> {
         let (callback_sender, callback_recv) = oneshot::channel();
         let _res = self

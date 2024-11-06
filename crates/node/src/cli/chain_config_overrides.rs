@@ -1,104 +1,120 @@
 use std::time::Duration;
 
-use anyhow::Context;
+use anyhow::{bail, Context};
+use blockifier::bouncer::BouncerConfig;
+use clap::Parser;
+use mp_utils::crypto::ZeroingPrivateKey;
 use serde::{Deserialize, Serialize};
 use serde_yaml::Value;
 use starknet_api::core::{ChainId, ContractAddress};
 
 use mp_block::H160;
-use mp_chain_config::{ChainConfig, StarknetVersion};
-use mp_utils::parsers::parse_key_value;
+use mp_chain_config::{
+    deserialize_bouncer_config, deserialize_starknet_version, serialize_bouncer_config, serialize_starknet_version,
+    ChainConfig, StarknetVersion,
+};
+use mp_utils::parsers::parse_key_value_yaml;
+use mp_utils::serde::{deserialize_duration, deserialize_private_key, serialize_duration};
 
 /// Override chain config parameters.
-/// Format: "--chain-config-override chain_id=NEW_MADARA --chain-config-override chain_name=NEW_NAME"
-#[derive(clap::Parser, Clone, Debug)]
+/// Format: "--chain-config-override chain_id=SN_MADARA,chain_name=MADARA,block_time=1500ms,bouncer_config.block_max_capacity.n_steps=100000000"
+#[derive(Parser, Clone, Debug)]
 pub struct ChainConfigOverrideParams {
-    #[clap(long = "chain-config-override", value_parser = parse_key_value, number_of_values = 1)]
-    pub overrides: Vec<(String, String)>,
+    #[clap(env = "MADARA_CHAIN_CONFIG_OVERRIDE", long = "chain-config-override", value_parser = parse_key_value_yaml, use_value_delimiter = true, value_delimiter = ',')]
+    pub overrides: Vec<(String, Value)>,
 }
 
-impl ChainConfigOverrideParams {
-    pub fn override_chain_config(&self, chain_config: ChainConfig) -> anyhow::Result<ChainConfig> {
-        let overridable = OverridableChainConfig::from(&chain_config);
-        let mut config_value =
-            serde_yaml::to_value(overridable).context("Failed to convert OverridableChainConfig to Value")?;
-
-        if let Value::Mapping(ref mut map) = config_value {
-            for (key, value) in &self.overrides {
-                if !map.contains_key(Value::String(key.clone())) {
-                    return Err(anyhow::anyhow!("The field '{}' is not overridable for the Chain Config.", key));
-                }
-                map.insert(Value::String(key.clone()), Value::String(value.clone()));
-            }
-        } else {
-            return Err(anyhow::anyhow!("Unexpected chain config structure."));
-        }
-
-        let updated_overridable: OverridableChainConfig =
-            serde_yaml::from_value(config_value).context("Failed to convert Value back to OverridableChainConfig")?;
-
-        Ok(ChainConfig {
-            versioned_constants: chain_config.versioned_constants,
-            bouncer_config: chain_config.bouncer_config,
-            ..updated_overridable.into()
-        })
-    }
-}
-
-/// Part of the Chain Config that we can override.
-// We need this proxy structure to implement Serialize -
-// which is not possible on the original ChainConfig because the bouncer config and
-// the versioned constants don't implement it.
-// Since we don't want to override those values anyway, we can create this wrapper.
 #[derive(Debug, Serialize, Deserialize)]
-pub struct OverridableChainConfig {
+pub struct ChainConfigOverridesInner {
     pub chain_name: String,
     pub chain_id: ChainId,
     pub native_fee_token_address: ContractAddress,
     pub parent_fee_token_address: ContractAddress,
+    #[serde(deserialize_with = "deserialize_starknet_version", serialize_with = "serialize_starknet_version")]
     pub latest_protocol_version: StarknetVersion,
+    #[serde(deserialize_with = "deserialize_duration", serialize_with = "serialize_duration")]
     pub block_time: Duration,
+    #[serde(deserialize_with = "deserialize_duration", serialize_with = "serialize_duration")]
     pub pending_block_update_time: Duration,
     pub execution_batch_size: usize,
+    #[serde(deserialize_with = "deserialize_bouncer_config", serialize_with = "serialize_bouncer_config")]
+    pub bouncer_config: BouncerConfig,
     pub sequencer_address: ContractAddress,
-    pub max_nonce_for_validation_skip: u64,
     pub eth_core_contract_address: H160,
+    pub eth_gps_statement_verifier: H160,
+    #[serde(default)]
+    #[serde(skip_serializing)]
+    #[serde(deserialize_with = "deserialize_private_key")]
+    pub private_key: ZeroingPrivateKey,
 }
 
-impl From<&ChainConfig> for OverridableChainConfig {
-    fn from(config: &ChainConfig) -> Self {
-        OverridableChainConfig {
-            chain_name: config.chain_name.clone(),
-            chain_id: config.chain_id.clone(),
-            native_fee_token_address: config.native_fee_token_address,
-            parent_fee_token_address: config.parent_fee_token_address,
-            latest_protocol_version: config.latest_protocol_version,
-            block_time: config.block_time,
-            pending_block_update_time: config.pending_block_update_time,
-            execution_batch_size: config.execution_batch_size,
-            sequencer_address: config.sequencer_address,
-            max_nonce_for_validation_skip: config.max_nonce_for_validation_skip,
-            eth_core_contract_address: config.eth_core_contract_address,
-        }
-    }
-}
+impl ChainConfigOverrideParams {
+    pub fn override_chain_config(&self, chain_config: ChainConfig) -> anyhow::Result<ChainConfig> {
+        let versioned_constants = chain_config.versioned_constants;
 
-impl From<OverridableChainConfig> for ChainConfig {
-    fn from(overridable: OverridableChainConfig) -> Self {
-        ChainConfig {
-            chain_name: overridable.chain_name,
-            chain_id: overridable.chain_id,
-            native_fee_token_address: overridable.native_fee_token_address,
-            parent_fee_token_address: overridable.parent_fee_token_address,
-            latest_protocol_version: overridable.latest_protocol_version,
-            block_time: overridable.block_time,
-            pending_block_update_time: overridable.pending_block_update_time,
-            execution_batch_size: overridable.execution_batch_size,
-            sequencer_address: overridable.sequencer_address,
-            max_nonce_for_validation_skip: overridable.max_nonce_for_validation_skip,
-            eth_core_contract_address: overridable.eth_core_contract_address,
-            versioned_constants: Default::default(),
-            bouncer_config: Default::default(),
+        let mut chain_config_overrides = serde_yaml::to_value(ChainConfigOverridesInner {
+            chain_name: chain_config.chain_name,
+            chain_id: chain_config.chain_id,
+            native_fee_token_address: chain_config.native_fee_token_address,
+            parent_fee_token_address: chain_config.parent_fee_token_address,
+            latest_protocol_version: chain_config.latest_protocol_version,
+            block_time: chain_config.block_time,
+            pending_block_update_time: chain_config.pending_block_update_time,
+            execution_batch_size: chain_config.execution_batch_size,
+            bouncer_config: chain_config.bouncer_config,
+            sequencer_address: chain_config.sequencer_address,
+            eth_core_contract_address: chain_config.eth_core_contract_address,
+            eth_gps_statement_verifier: chain_config.eth_gps_statement_verifier,
+            private_key: chain_config.private_key,
+        })
+        .context("Failed to convert ChainConfig to Value")?;
+
+        for (key, value) in &self.overrides {
+            // Split the key by '.' to handle nested fields
+            let key_parts = key.split('.').collect::<Vec<_>>();
+
+            // Navigate to the last field in the path
+            let mut current_value = &mut chain_config_overrides;
+            for part in key_parts.iter().take(key_parts.len() - 1) {
+                current_value = match current_value.get_mut(part) {
+                    Some(v) => v,
+                    None => bail!("Invalid chain config override key path: {}", key),
+                };
+            }
+
+            // Set the value to the final field in the path
+            let last_key =
+                key_parts.last().with_context(|| format!("Invalid chain config override key path: {}", key))?;
+            match current_value.get_mut(*last_key) {
+                Some(field) => {
+                    *field = value.clone();
+                }
+                None => {
+                    bail!("Invalid chain config override key path: {}", key);
+                }
+            }
         }
+
+        let chain_config_overrides: ChainConfigOverridesInner = serde_yaml::from_value(chain_config_overrides)
+            .context("Failed to convert Value to ChainConfigOverridesInner")?;
+
+        Ok(ChainConfig {
+            chain_name: chain_config_overrides.chain_name,
+            chain_id: chain_config_overrides.chain_id,
+            feeder_gateway_url: chain_config.feeder_gateway_url,
+            gateway_url: chain_config.gateway_url,
+            native_fee_token_address: chain_config_overrides.native_fee_token_address,
+            parent_fee_token_address: chain_config_overrides.parent_fee_token_address,
+            latest_protocol_version: chain_config_overrides.latest_protocol_version,
+            block_time: chain_config_overrides.block_time,
+            pending_block_update_time: chain_config_overrides.pending_block_update_time,
+            execution_batch_size: chain_config_overrides.execution_batch_size,
+            bouncer_config: chain_config_overrides.bouncer_config,
+            sequencer_address: chain_config_overrides.sequencer_address,
+            eth_core_contract_address: chain_config_overrides.eth_core_contract_address,
+            versioned_constants,
+            eth_gps_statement_verifier: chain_config_overrides.eth_gps_statement_verifier,
+            private_key: chain_config_overrides.private_key,
+        })
     }
 }

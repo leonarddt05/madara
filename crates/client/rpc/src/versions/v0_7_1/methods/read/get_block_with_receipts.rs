@@ -11,7 +11,7 @@ pub fn get_block_with_receipts(
     starknet: &Starknet,
     block_id: BlockId,
 ) -> StarknetRpcResult<MaybePendingBlockWithReceipts> {
-    log::debug!("block_id {block_id:?}");
+    tracing::debug!("get_block_with_receipts called with {:?}", block_id);
     let block = starknet.get_block(&block_id)?;
 
     let transactions_core = Iterator::zip(block.inner.transactions.iter(), block.info.tx_hashes())
@@ -196,9 +196,9 @@ mod tests {
                             transaction_commitment: Felt::from_hex_unchecked("0xbabaa0"),
                             event_count: 0,
                             event_commitment: Felt::from_hex_unchecked("0xb"),
-                            state_diff_length: 5,
-                            state_diff_commitment: Felt::from_hex_unchecked("0xb1"),
-                            receipt_commitment: Felt::from_hex_unchecked("0xb4"),
+                            state_diff_length: Some(5),
+                            state_diff_commitment: Some(Felt::from_hex_unchecked("0xb1")),
+                            receipt_commitment: Some(Felt::from_hex_unchecked("0xb4")),
                             protocol_version: StarknetVersion::V0_13_1_1,
                             l1_gas_price: GasPrices {
                                 eth_l1_gas_price: 123,

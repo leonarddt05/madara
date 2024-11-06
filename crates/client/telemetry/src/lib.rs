@@ -30,7 +30,7 @@ pub struct TelemetryHandle(Option<Arc<mpsc::Sender<TelemetryEvent>>>);
 impl TelemetryHandle {
     pub fn send(&self, verbosity: VerbosityLevel, message: serde_json::Value) {
         if message.get("msg").is_none() {
-            log::warn!("Telemetry messages should have a message type");
+            tracing::warn!("Telemetry messages should have a message type");
         }
         if let Some(tx) = &self.0 {
             // drop the message if the channel if full.
@@ -39,21 +39,21 @@ impl TelemetryHandle {
     }
 }
 pub struct TelemetryService {
-    no_telemetry: bool,
+    telemetry: bool,
     telemetry_endpoints: Vec<(String, u8)>,
     telemetry_handle: TelemetryHandle,
     start_state: Option<mpsc::Receiver<TelemetryEvent>>,
 }
 
 impl TelemetryService {
-    pub fn new(no_telemetry: bool, telemetry_endpoints: Vec<(String, u8)>) -> anyhow::Result<Self> {
-        let (telemetry_handle, start_state) = if no_telemetry {
+    pub fn new(telemetry: bool, telemetry_endpoints: Vec<(String, u8)>) -> anyhow::Result<Self> {
+        let (telemetry_handle, start_state) = if !telemetry {
             (TelemetryHandle(None), None)
         } else {
             let (tx, rx) = mpsc::channel(1024);
             (TelemetryHandle(Some(Arc::new(tx))), Some(rx))
         };
-        Ok(Self { no_telemetry, telemetry_endpoints, telemetry_handle, start_state })
+        Ok(Self { telemetry, telemetry_endpoints, telemetry_handle, start_state })
     }
 
     pub fn new_handle(&self) -> TelemetryHandle {
@@ -94,7 +94,7 @@ impl TelemetryService {
 #[async_trait::async_trait]
 impl Service for TelemetryService {
     async fn start(&mut self, join_set: &mut JoinSet<anyhow::Result<()>>) -> anyhow::Result<()> {
-        if self.no_telemetry {
+        if !self.telemetry {
             return Ok(());
         }
 
@@ -107,14 +107,14 @@ impl Service for TelemetryService {
                 let websocket = match client.get(endpoint).upgrade().send().await {
                     Ok(ws) => ws,
                     Err(err) => {
-                        log::warn!("Could not connect to telemetry endpoint '{endpoint}': {err:?}");
+                        tracing::warn!("Could not connect to telemetry endpoint '{endpoint}': {err:?}");
                         return None;
                     }
                 };
                 let websocket = match websocket.into_websocket().await {
                     Ok(ws) => ws,
                     Err(err) => {
-                        log::warn!("Could not connect websocket to telemetry endpoint '{endpoint}': {err:?}");
+                        tracing::warn!("Could not connect websocket to telemetry endpoint '{endpoint}': {err:?}");
                         return None;
                     }
                 };
@@ -125,7 +125,7 @@ impl Service for TelemetryService {
             let rx = &mut rx;
 
             while let Some(event) = channel_wait_or_graceful_shutdown(rx.recv()).await {
-                log::debug!(
+                tracing::debug!(
                     "Sending telemetry event '{}'.",
                     event.message.get("msg").and_then(|e| e.as_str()).unwrap_or("<unknown>")
                 );
@@ -136,11 +136,13 @@ impl Service for TelemetryService {
                 futures::future::join_all(clients.iter_mut().map(|client| async move {
                     if let Some((websocket, verbosity, endpoint)) = client {
                         if *verbosity >= event.verbosity as u8 {
-                            log::trace!("send telemetry to '{endpoint}'");
+                            tracing::trace!("send telemetry to '{endpoint}'");
                             match websocket.send(Message::Text(msg.clone())).await {
                                 Ok(_) => {}
                                 Err(err) => {
-                                    log::warn!("Could not connect send telemetry to endpoint '{endpoint}': {err:#}");
+                                    tracing::warn!(
+                                        "Could not connect send telemetry to endpoint '{endpoint}': {err:#}"
+                                    );
                                 }
                             }
                         }

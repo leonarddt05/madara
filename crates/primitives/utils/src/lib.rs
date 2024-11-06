@@ -1,5 +1,6 @@
 #![allow(clippy::new_without_default)]
 
+pub mod crypto;
 pub mod parsers;
 pub mod serde;
 pub mod service;
@@ -29,7 +30,7 @@ where
 static CTRL_C: AtomicBool = AtomicBool::new(false);
 
 async fn graceful_shutdown_inner() {
-    let sigint = async {
+    let sigterm = async {
         match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
             Ok(mut signal) => signal.recv().await,
             // SIGTERM not supported
@@ -38,7 +39,7 @@ async fn graceful_shutdown_inner() {
     };
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {},
-        _ = sigint => {},
+        _ = sigterm => {},
     };
     CTRL_C.store(true, Ordering::SeqCst);
 }
@@ -84,10 +85,12 @@ impl Drop for StopHandle {
 pub struct PerfStopwatch(pub Instant);
 
 impl PerfStopwatch {
+    #[tracing::instrument(name = "PerfStopwatch::new")]
     pub fn new() -> PerfStopwatch {
         PerfStopwatch(Instant::now())
     }
 
+    #[tracing::instrument(name = "PerfStopwatch::elapsed", skip(self))]
     pub fn elapsed(&self) -> Duration {
         self.0.elapsed()
     }
@@ -96,6 +99,6 @@ impl PerfStopwatch {
 #[macro_export]
 macro_rules! stopwatch_end {
     ($stopwatch:expr, $($arg:tt)+) => {
-        log::debug!($($arg)+, $stopwatch.elapsed())
+        tracing::debug!($($arg)+, $stopwatch.elapsed())
     }
 }

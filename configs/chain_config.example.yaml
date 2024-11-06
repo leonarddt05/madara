@@ -3,6 +3,10 @@ chain_name: "Starknet Mainnet"
 
 chain_id: "SN_MAIN"
 
+# The URL of the gateway and Feeder Gateway your nodes should sync from.
+feeder_gateway_url: "http://localhost:8080/feeder_gateway/"
+gateway_url: "http://localhost:8080/gateway/"
+
 # For starknet, this is the STRK ERC-20 contract on starknet.
 native_fee_token_address: "0x04718f5a0fc34cc1af16a1cdee98ffb20c31f5cd61d6ab07201858f4287c938d"
 
@@ -10,7 +14,7 @@ native_fee_token_address: "0x04718f5a0fc34cc1af16a1cdee98ffb20c31f5cd61d6ab07201
 parent_fee_token_address: "0x049d36570d4e46f48e99674bd3fcc84644ddd6b96f7c741b1562b82f9e004dc7"
 
 # Paths to JSON files containing blockifier's constants for different versions
-versioned_constants:
+versioned_constants_path:
   "0.13.0": "crates/primitives/chain_config/resources/versioned_constants_13_0.json"
   "0.13.1": "crates/primitives/chain_config/resources/versioned_constants_13_1.json"
   "0.13.1.1": "crates/primitives/chain_config/resources/versioned_constants_13_1_1.json"
@@ -65,8 +69,3 @@ bouncer_config:
 # /!\ Only used for block production.
 # Address of the sequencer (0x0 for a full node).
 sequencer_address: "0x0"
-
-# /!\ Only used for block production.
-# When deploying an account and invoking a contract at the same time, we want to skip the validation step for the invoke tx.
-# This number is the maximum nonce the invoke tx can have to qualify for the validation skip.
-max_nonce_for_validation_skip: 2
