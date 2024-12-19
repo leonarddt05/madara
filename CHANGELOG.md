@@ -3,6 +3,7 @@
 ## Next release
 
 - feat(db): add database version management system
+- fix(rpc): fix BroadcastedDeclareTxn V3 in starknet-types-rpc
 - fix: oracle need condition
 - fix(block_production): continue pending block now reexecutes the previous transactions
 - feat(services): reworked Madara services for better cancellation control
