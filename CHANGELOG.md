@@ -2,6 +2,8 @@
 
 ## Next release
 
+- refactor(gateway): remove query-only support from user transactions
+- fix(gateway): serialize tip as hex in UserTransaction
 - fix: devnet accounts getting deployed in sequencer mode
 - fix(rpc): fix BroadcastedDeclareTxn V3 in starknet-types-rpc
 - fix: oracle need condition
