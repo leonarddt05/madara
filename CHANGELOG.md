@@ -3,6 +3,7 @@
 ## Next release
 
 - chore: remove redundant dead_code attribute
+- fix: trim hash of eth state was failing with 0x0
 - fix: devnet accounts getting deployed in sequencer mode
 - fix(rpc): fix BroadcastedDeclareTxn V3 in starknet-types-rpc
 - fix: oracle need condition
